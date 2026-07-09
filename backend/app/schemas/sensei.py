@@ -2,6 +2,11 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 
+class Source(BaseModel):
+    title: str
+    url: str
+
+
 class ConceptItem(BaseModel):
     title: str
     definition: str
@@ -27,6 +32,7 @@ class SenseiContentResponse(BaseModel):
     topic: str
     concepts: List[ConceptItem]
     practice_questions: List[PracticeQuestion]
+    sources: List[Source] = []
 
 
 #Chat
@@ -45,6 +51,7 @@ class SenseiChatRequest(BaseModel):
 
 class SenseiChatResponse(BaseModel):
     reply: str
+    sources: List[Source] = []
 
 
 # Chat History
@@ -53,6 +60,7 @@ class ChatHistoryMessage(BaseModel):
     id: int
     role: str
     content: str
+    sources: List[Source] = []
 
 class ChatHistoryResponse(BaseModel):
     task_id: int
@@ -62,3 +70,4 @@ class SaveMessageRequest(BaseModel):
     task_id: int
     role: str
     content: str
+    sources: List[Source] = []
