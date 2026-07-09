@@ -47,7 +47,7 @@ def get_history(task_id: int, current_user: dict = Depends(get_current_user)):
 @router.post("/history/message", response_model=ChatHistoryMessage)
 def save_message(payload: SaveMessageRequest, current_user: dict = Depends(get_current_user)):
     try:
-        return chat_history_service.save_message(payload.task_id, current_user["id"], payload.role, payload.content)
+        return chat_history_service.save_message(payload.task_id, current_user["id"], payload.role, payload.content, payload.sources)
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Failed to save message") from exc
 

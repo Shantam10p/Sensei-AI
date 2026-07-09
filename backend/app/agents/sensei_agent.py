@@ -22,11 +22,13 @@ class ContentAgentState(TypedDict):
     request: SenseiContentRequest
     concepts: list[dict]
     practice_questions: list[dict]
+    sources: list[dict]
 
 
 class ChatAgentState(TypedDict):
     request: SenseiChatRequest
     reply: str
+    sources: list[dict]
 
 
 class SenseiAgent:
@@ -69,34 +71,43 @@ class SenseiAgent:
 
     def generate_content(self, request: SenseiContentRequest) -> dict:
         result = self.content_graph.invoke(
-            {"request": request, "concepts": [], "practice_questions": []}
+            {"request": request, "concepts": [], "practice_questions": [], "sources": []}
         )
-        return {"concepts": result["concepts"], "practice_questions": result["practice_questions"]}
+        return {
+            "concepts": result["concepts"],
+            "practice_questions": result["practice_questions"],
+            "sources": result.get("sources", []),
+        }
 
-    def chat(self, request: SenseiChatRequest) -> str:
-        result = self.chat_graph.invoke({"request": request, "reply": ""})
-        return result["reply"]
+    def chat(self, request: SenseiChatRequest) -> dict:
+        result = self.chat_graph.invoke({"request": request, "reply": "", "sources": []})
+        return {"reply": result["reply"], "sources": result.get("sources", [])}
 
-    def _run_with_tools(self, messages: list):
+    def _run_with_tools(self, messages: list) -> tuple:
         """Run a bounded tool-calling loop.
 
         Invokes the (tool-bound) LLM on the message list. While the model
         responds with tool calls, we execute each requested tool, append the
         results as ToolMessages, and re-invoke — up to MAX_TOOL_ITERATIONS.
-        Returns the final AIMessage once the model stops requesting tools
-        (or the iteration cap is hit). If no tools are bound, this is a single
-        plain invoke.
+
+        Returns a ``(final_message, sources)`` tuple. ``sources`` is a deduped
+        list of ``{"title", "url"}`` dicts gathered from every search result
+        the model consulted (empty when no tools ran). If no tools are bound,
+        this is a single plain invoke with no sources.
         """
-        # No tools bound → behave like a plain single-shot call.
+        # No tools bound → behave like a plain single-shot call, no sources.
         if not self.tools:
-            return self.llm.invoke(messages)
+            return self.llm.invoke(messages), []
 
         working = list(messages)
+        sources: list[dict] = []
+        seen_urls: set[str] = set()
+
         for _ in range(MAX_TOOL_ITERATIONS):
             response = self.llm.invoke(working)
             tool_calls = getattr(response, "tool_calls", None)
             if not tool_calls:
-                return response
+                return response, sources
             # Keep the assistant turn (with its tool_calls) before the results.
             working.append(response)
             for call in tool_calls:
@@ -106,13 +117,34 @@ class SenseiAgent:
                 else:
                     try:
                         output = tool.invoke(call["args"])
+                        self._collect_sources(output, sources, seen_urls)
                     except Exception as exc:  # never let a search failure break the reply
                         output = f"Search failed: {exc}"
                 working.append(
                     ToolMessage(content=str(output), tool_call_id=call["id"])
                 )
         # Cap reached: force one final answer without offering tools again.
-        return self._raw_llm.invoke(working)
+        return self._raw_llm.invoke(working), sources
+
+    @staticmethod
+    def _collect_sources(tool_output, sources: list[dict], seen_urls: set[str]) -> None:
+        """Extract {title, url} from a Tavily tool result into `sources`.
+
+        TavilySearch returns a dict like {"results": [{"title", "url", ...}]}.
+        We dedupe by URL and cap the total so the UI stays tidy.
+        """
+        if not isinstance(tool_output, dict):
+            return
+        for item in tool_output.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            sources.append({"title": item.get("title") or url, "url": url})
+            if len(sources) >= 8:
+                return
 
     def _generate_content(self, state: ContentAgentState) -> ContentAgentState:
         request = state["request"]
@@ -122,6 +154,7 @@ class SenseiAgent:
                 **state,
                 "concepts": self._fallback_concepts(request.topic),
                 "practice_questions": self._fallback_practice(request.topic),
+                "sources": [],
             }
 
         prompt = f"""You are Sensei AI, a focused study assistant. A student needs exam-ready notes on the following:
@@ -168,7 +201,7 @@ Rules:
 - Return only the JSON object, nothing else"""
 
         try:
-            response = self._run_with_tools([HumanMessage(content=prompt)])
+            response, sources = self._run_with_tools([HumanMessage(content=prompt)])
             content = response.content if isinstance(response.content, str) else ""
             parsed = json.loads(content)
             concepts = parsed.get("concepts", [])
@@ -178,8 +211,9 @@ Rules:
         except (json.JSONDecodeError, ValueError, TypeError):
             concepts = self._fallback_concepts(request.topic)
             practice_questions = self._fallback_practice(request.topic)
+            sources = []  # fallback content wasn't grounded in the search results
 
-        return {**state, "concepts": concepts, "practice_questions": practice_questions}
+        return {**state, "concepts": concepts, "practice_questions": practice_questions, "sources": sources}
 
     def _summarize(self, messages: list) -> str:
         prompt = f"Summarize this tutoring conversation in 3-5 sentences, capturing the key topics and conclusions discussed:\n\n"
@@ -196,7 +230,7 @@ Rules:
         request = state["request"]
 
         if self.llm is None:
-            return {**state, "reply": "I'm not available right now. Please try again later."}
+            return {**state, "reply": "I'm not available right now. Please try again later.", "sources": []}
 
         system = SystemMessage(content=f"""You are Sensei AI, an educational assistant helping a student study.
 Topic: {request.topic}
@@ -222,13 +256,15 @@ You have a web search tool. ALWAYS use it before answering — search for the st
 
         messages.append(HumanMessage(content=request.message))
 
+        sources: list[dict] = []
         try:
-            response = self._run_with_tools(messages)
+            response, sources = self._run_with_tools(messages)
             reply = response.content if isinstance(response.content, str) else "I couldn't generate a response."
         except Exception:
             reply = "I'm having trouble connecting right now. Please try again."
+            sources = []
 
-        return {**state, "reply": reply}
+        return {**state, "reply": reply, "sources": sources}
 
     def _fallback_concepts(self, topic: str) -> list[dict]:
         return [

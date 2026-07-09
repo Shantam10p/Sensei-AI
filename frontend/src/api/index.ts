@@ -10,6 +10,7 @@ import type {
   ChatHistoryResponse,
   SenseiChatMessage,
   SenseiContentResponse,
+  SenseiSource,
 } from "../types/sensei";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000/api/v1";
@@ -195,6 +196,7 @@ export async function saveChatMessage(payload: {
   task_id: number;
   role: string;
   content: string;
+  sources?: SenseiSource[];
 }): Promise<void> {
   await fetch(`${API_BASE_URL}/chat/history/message`, {
     method: "POST",
@@ -215,7 +217,7 @@ export async function sendSenseiMessage(payload: {
   course_name: string;
   history: SenseiChatMessage[];
   message: string;
-}): Promise<{ reply: string }> {
+}): Promise<{ reply: string; sources?: SenseiSource[] }> {
   const response = await fetch(`${API_BASE_URL}/chat/message`, {
     method: "POST",
     headers: buildAuthHeaders(true),

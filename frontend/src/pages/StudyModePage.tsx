@@ -17,6 +17,7 @@ import type {
   SenseiConceptItem,
   SenseiContentResponse,
   SenseiPracticeQuestion,
+  SenseiSource,
 } from "../types/sensei";
 
 type StudyModeLocationState = {
@@ -44,6 +45,47 @@ function deriveTopicFromTitle(title: string) {
     .replace(/^(Study|Continue|Revisit|Review)\s+/i, "")
     .replace(/\s+using\s+.+$/i, "")
     .trim();
+}
+
+function hostLabel(url: string) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+// Renders the web-search sources Sensei used to ground an answer.
+function SourcesList({ sources }: { sources: SenseiSource[] }) {
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div className="mt-3 border-t border-[#2a2a2a] pt-3">
+      <div className="mb-2 flex items-center gap-1.5">
+        <span className="material-symbols-outlined text-[13px] text-[#8fa1a1]">travel_explore</span>
+        <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-[#8fa1a1]">Sources</span>
+      </div>
+      <ul className="space-y-1.5">
+        {sources.map((s, i) => (
+          <li key={i} className="flex items-start gap-2">
+            <span className="mt-[2px] shrink-0 text-[10px] font-mono tabular-nums text-[#767575]">
+              {String(i + 1).padStart(2, "0")}
+            </span>
+            <a
+              href={s.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="group min-w-0 text-[11px] leading-relaxed text-[#acabaa] hover:text-[#cdc0ec] transition-colors"
+            >
+              <span className="underline decoration-[#3a3a3a] decoration-dotted underline-offset-2 group-hover:decoration-[#cdc0ec]">
+                {s.title}
+              </span>
+              <span className="ml-1.5 text-[10px] text-[#767575]">{hostLabel(s.url)}</span>
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 export default function StudyModePage() {
@@ -81,6 +123,7 @@ export default function StudyModePage() {
 
   const [concepts, setConcepts] = useState<SenseiConceptItem[]>([]);
   const [practiceQuestions, setPracticeQuestions] = useState<SenseiPracticeQuestion[]>([]);
+  const [contentSources, setContentSources] = useState<SenseiSource[]>([]);
   const [expandedAnswers, setExpandedAnswers] = useState<Set<number>>(new Set());
   const [contentLoading, setContentLoading] = useState(true);
   const [contentError, setContentError] = useState<string | null>(null);
@@ -166,11 +209,13 @@ export default function StudyModePage() {
         if (cancelled) return;
         setConcepts(contentData.concepts);
         setPracticeQuestions(contentData.practice_questions);
+        setContentSources(contentData.sources ?? []);
         if (historyData.messages.length > 0) {
           setChatHistory(
             historyData.messages.map((m) => ({
               role: m.role as "user" | "assistant",
               content: m.content,
+              sources: m.sources ?? [],
             }))
           );
         } else {
@@ -228,9 +273,9 @@ export default function StudyModePage() {
         history: chatHistory,
         message: trimmed,
       });
-      const asstMsg: SenseiChatMessage = { role: "assistant", content: res.reply };
+      const asstMsg: SenseiChatMessage = { role: "assistant", content: res.reply, sources: res.sources ?? [] };
       setChatHistory([...updated, asstMsg]);
-      saveChatMessage({ task_id: session.id, role: "assistant", content: res.reply });
+      saveChatMessage({ task_id: session.id, role: "assistant", content: res.reply, sources: res.sources ?? [] });
     } catch {
       setChatError("Sensei couldn't respond. Please try again.");
       setChatHistory(chatHistory);
@@ -330,6 +375,11 @@ export default function StudyModePage() {
               )}
             </div>
           ))}
+          {contentSources.length > 0 && (
+            <div className="rounded-xl bg-[#161616] border border-[#202020] px-4 py-4 md:px-5 md:py-5">
+              <SourcesList sources={contentSources} />
+            </div>
+          )}
         </div>
       )}
 
@@ -416,6 +466,9 @@ export default function StudyModePage() {
                 </ReactMarkdown>
               ) : (
                 msg.content
+              )}
+              {msg.role === "assistant" && msg.sources && msg.sources.length > 0 && (
+                <SourcesList sources={msg.sources} />
               )}
             </div>
           ))}
