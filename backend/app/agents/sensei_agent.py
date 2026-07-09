@@ -1,12 +1,21 @@
 import json
 from typing import TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from app.core.config import get_settings
 from app.schemas.sensei import SenseiChatRequest, SenseiContentRequest
+
+try:
+    from langchain_tavily import TavilySearch
+except ImportError:  # package not installed — search stays disabled
+    TavilySearch = None
+
+# Bound on how many times the model may call the search tool in a single
+# request, to cap latency and cost.
+MAX_TOOL_ITERATIONS = 3
 
 
 class ContentAgentState(TypedDict):
@@ -23,11 +32,26 @@ class ChatAgentState(TypedDict):
 class SenseiAgent:
     def __init__(self) -> None:
         settings = get_settings()
-        self.llm = (
+        base_llm = (
             ChatOpenAI(model=settings.PLANNER_AGENT_MODEL, api_key=settings.OPENAI_API_KEY, temperature=0)
             if settings.OPENAI_API_KEY
             else None
         )
+
+        # Build the web-search tool only if both the LLM and a Tavily key exist.
+        # Missing either → self.tools stays empty and the agent behaves exactly
+        # as before (no search), preserving graceful degradation.
+        self.tools: list = []
+        self._tools_by_name: dict = {}
+        if base_llm is not None and TavilySearch is not None and settings.TAVILY_API_KEY:
+            search_tool = TavilySearch(max_results=5, topic="general", api_key=settings.TAVILY_API_KEY)
+            self.tools = [search_tool]
+            self._tools_by_name = {t.name: t for t in self.tools}
+
+        # Bind the tools so the model can choose to call them; if there are no
+        # tools, self.llm is just the plain model.
+        self.llm = base_llm.bind_tools(self.tools) if (base_llm is not None and self.tools) else base_llm
+        self._raw_llm = base_llm  # unbound handle, used where tools aren't wanted
 
         # content graph
         content_graph = StateGraph(ContentAgentState)
@@ -53,6 +77,43 @@ class SenseiAgent:
         result = self.chat_graph.invoke({"request": request, "reply": ""})
         return result["reply"]
 
+    def _run_with_tools(self, messages: list):
+        """Run a bounded tool-calling loop.
+
+        Invokes the (tool-bound) LLM on the message list. While the model
+        responds with tool calls, we execute each requested tool, append the
+        results as ToolMessages, and re-invoke — up to MAX_TOOL_ITERATIONS.
+        Returns the final AIMessage once the model stops requesting tools
+        (or the iteration cap is hit). If no tools are bound, this is a single
+        plain invoke.
+        """
+        # No tools bound → behave like a plain single-shot call.
+        if not self.tools:
+            return self.llm.invoke(messages)
+
+        working = list(messages)
+        for _ in range(MAX_TOOL_ITERATIONS):
+            response = self.llm.invoke(working)
+            tool_calls = getattr(response, "tool_calls", None)
+            if not tool_calls:
+                return response
+            # Keep the assistant turn (with its tool_calls) before the results.
+            working.append(response)
+            for call in tool_calls:
+                tool = self._tools_by_name.get(call["name"])
+                if tool is None:
+                    output = f"Tool '{call['name']}' is not available."
+                else:
+                    try:
+                        output = tool.invoke(call["args"])
+                    except Exception as exc:  # never let a search failure break the reply
+                        output = f"Search failed: {exc}"
+                working.append(
+                    ToolMessage(content=str(output), tool_call_id=call["id"])
+                )
+        # Cap reached: force one final answer without offering tools again.
+        return self._raw_llm.invoke(working)
+
     def _generate_content(self, state: ContentAgentState) -> ContentAgentState:
         request = state["request"]
 
@@ -69,6 +130,8 @@ Topic: {request.topic}
 Course: {request.course_name}
 
 Your job is to produce structured study notes that cover EVERY subtopic a student needs for this topic — ordered from foundational to advanced, so each concept builds naturally on the last. Think of it like a smart friend explaining the topic from scratch in the right order.
+
+You have a web search tool. ALWAYS use it before writing the notes — search for the topic and ground your content in what you find. Prefer well-known, verified educational sources such as W3Schools, GeeksforGeeks, MDN Web Docs, official language/framework documentation, and reputable university or textbook material. Avoid forums, opinion blogs, and unverified sources. Once you have gathered reliable material, produce the final notes.
 
 Return raw valid JSON only. No markdown, no explanation outside the JSON.
 
@@ -105,7 +168,7 @@ Rules:
 - Return only the JSON object, nothing else"""
 
         try:
-            response = self.llm.invoke(prompt)
+            response = self._run_with_tools([HumanMessage(content=prompt)])
             content = response.content if isinstance(response.content, str) else ""
             parsed = json.loads(content)
             concepts = parsed.get("concepts", [])
@@ -124,7 +187,7 @@ Rules:
             role = "Student" if msg.role == "user" else "Sensei"
             prompt += f"{role}: {msg.content}\n"
         try:
-            response = self.llm.invoke(prompt)
+            response = self._raw_llm.invoke(prompt)
             return response.content if isinstance(response.content, str) else ""
         except Exception:
             return ""
@@ -138,7 +201,8 @@ Rules:
         system = SystemMessage(content=f"""You are Sensei AI, an educational assistant helping a student study.
 Topic: {request.topic}
 Course: {request.course_name}
-Keep answers focused, educational, and concise. If asked something off-topic, gently redirect to {request.topic}.""")
+Keep answers focused, educational, and concise. If asked something off-topic, gently redirect to {request.topic}.
+You have a web search tool. ALWAYS use it before answering — search for the student's question and ground your reply in what you find. Prefer well-known, verified educational sources such as W3Schools, GeeksforGeeks, MDN Web Docs, official language/framework documentation, and reputable university or textbook material. Avoid forums, opinion blogs, and unverified sources.""")
 
         WINDOW = 10
         history = request.history
@@ -159,7 +223,7 @@ Keep answers focused, educational, and concise. If asked something off-topic, ge
         messages.append(HumanMessage(content=request.message))
 
         try:
-            response = self.llm.invoke(messages)
+            response = self._run_with_tools(messages)
             reply = response.content if isinstance(response.content, str) else "I couldn't generate a response."
         except Exception:
             reply = "I'm having trouble connecting right now. Please try again."
